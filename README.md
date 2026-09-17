@@ -21,8 +21,13 @@ npm install
 ```bash
 cp .env.example .env.local
 ```
-3. Fill (optional for persistence):
-- `REDIS_URL` or `KV_REST_API_URL/KV_REST_API_TOKEN`
+3. Fill:
+- `NEXT_PUBLIC_GAME_CONTRACT_ADDRESS` - deployed `GaslessScoreGame` (required
+  for verified scores)
+- `NEXT_PUBLIC_APP_URL` - public URL used in the Mini App embed metadata
+- `REDIS_URL` or `KV_REST_API_URL/KV_REST_API_TOKEN` (optional, for persistence)
+- `PAYMASTER_SERVICE_URL` (optional; `/api/paymaster` proxies only sponsorship
+  RPC methods, same-origin, rate limited)
 4. Run app:
 ```bash
 npm run dev
@@ -32,8 +37,15 @@ npm run dev
 See `contracts/README.md`.
 
 ## Onchain submit flow
-1. App submits a wallet transaction on Base mainnet (`0x2105`).
-2. On success, app marks the run as verified in leaderboard storage.
+1. App encodes `GaslessScoreGame.submitScore(score)` and sends it on Base
+   mainnet (`0x2105`). With `NEXT_PUBLIC_GAME_CONTRACT_ADDRESS` unset or zero it
+   falls back to a self-transfer, and no score reaches the contract.
+2. The server re-reads `bestScore(address)` from the contract before it fills
+   the `verifiedBestScore` column, so a client cannot mark itself verified.
+   Without a configured contract nothing is ever marked verified.
+
+Note: the offchain `bestScore`/`level` columns still come from the client and
+are not authenticated. Only `verifiedBestScore` is backed by the contract.
 
 ## Prepare for Base App launch
 1. Deploy app to a public HTTPS domain.

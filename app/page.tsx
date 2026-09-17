@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { TouchEvent } from "react";
 import sdk from "@farcaster/miniapp-sdk";
-import { Address } from "viem";
+import { Address, encodeFunctionData, isAddress } from "viem";
+import { gameAbi } from "@/lib/gameAbi";
 
 type EthereumProvider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<any>;
@@ -41,6 +42,23 @@ const CHAIN_ID_HEX = "0x2105";
 const WALLET_KEY = "pragma_wallet";
 const BUILDER_CODE = "bc_oub26f3r";
 const DATA_SUFFIX = "0x62635f6f756232366633720b0080218021802180218021802180218021";
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+function getGameContractAddress(): Address | null {
+  const raw = String(process.env.NEXT_PUBLIC_GAME_CONTRACT_ADDRESS ?? "").trim();
+  if (!raw || !isAddress(raw) || raw.toLowerCase() === ZERO_ADDRESS) return null;
+  return raw as Address;
+}
+
+// Embedded wallet webviews can block storage entirely, where an unguarded
+// setItem throws and aborts the connect flow.
+function storeWallet(address: string) {
+  try {
+    window.localStorage.setItem(WALLET_KEY, address);
+  } catch {
+    // remembering the address is a convenience, not a requirement
+  }
+}
 
 const DEFAULT_ARENA_WIDTH = 320;
 const DEFAULT_ARENA_HEIGHT = 440;
@@ -58,6 +76,13 @@ const MAX_HASTE_SECONDS = 8;
 const MAX_RAPID_SECONDS = 8;
 const BLADES_DURATION_SECONDS = 10;
 const BLADE_MAX_DAMAGE = 0.9;
+
+function errorText(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : "";
+  if (!message) return fallback;
+  if (/user rejected|denied|4001/i.test(message)) return "Transaction rejected in wallet.";
+  return `${fallback} ${message.slice(0, 120)}`;
+}
 
 function shortAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
@@ -131,10 +156,8 @@ export default function HomePage() {
   const [bladesLeftMs, setBladesLeftMs] = useState(0);
   const [shieldCharges, setShieldCharges] = useState(0);
 
-  const provider = useMemo(() => {
-    if (typeof window === "undefined") return null;
-    return (window as Window & { ethereum?: EthereumProvider }).ethereum ?? null;
-  }, []);
+  const [provider, setProvider] = useState<EthereumProvider | null>(null);
+  const [statusMessage, setStatusMessage] = useState("");
 
   const runningRef = useRef(false);
   const arenaRef = useRef<HTMLDivElement | null>(null);
@@ -169,7 +192,12 @@ export default function HomePage() {
 
   const loadLeaderboard = useCallback(async (address?: string) => {
     const url = address ? `/api/leaderboard?address=${encodeURIComponent(address)}` : "/api/leaderboard";
-    const res = await fetch(url, { cache: "no-store" });
+    let res: Response;
+    try {
+      res = await fetch(url, { cache: "no-store" });
+    } catch {
+      return;
+    }
     if (!res.ok) return;
     const json = (await res.json()) as {
       leaderboard: LeaderboardEntry[];
@@ -313,20 +341,48 @@ export default function HomePage() {
 
   const connect = useCallback(async () => {
     if (!provider) {
+      setStatusMessage("No wallet provider available in this app.");
       return;
     }
-    const accounts = (await provider.request({ method: "eth_requestAccounts" })) as Address[];
-    if (!accounts.length) {
-      return;
+    try {
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as Address[];
+      if (!accounts.length) {
+        setStatusMessage("Wallet returned no account.");
+        return;
+      }
+      const addr = accounts[0].toLowerCase() as Address;
+      setAccount(addr);
+      storeWallet(addr);
+      setStatusMessage("");
+      await loadLeaderboard(addr);
+    } catch (error) {
+      // An unhandled rejection here left the button looking like it did nothing.
+      setStatusMessage(errorText(error, "Could not connect the wallet."));
     }
-    const addr = accounts[0].toLowerCase() as Address;
-    setAccount(addr);
-    localStorage.setItem(WALLET_KEY, addr);
-    await loadLeaderboard(addr);
   }, [loadLeaderboard, provider]);
 
   useEffect(() => {
     sdk.actions.ready().catch(() => null);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const resolveProvider = async () => {
+      let resolved: EthereumProvider | null = null;
+      try {
+        resolved = (await sdk.wallet.getEthereumProvider()) as EthereumProvider | null;
+      } catch {
+        resolved = null;
+      }
+      if (!resolved && typeof window !== "undefined") {
+        resolved = (window as Window & { ethereum?: EthereumProvider }).ethereum ?? null;
+      }
+      if (!cancelled) setProvider(resolved);
+    };
+    void resolveProvider();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -344,9 +400,11 @@ export default function HomePage() {
         if (accounts.length) {
           const addr = accounts[0].toLowerCase() as Address;
           setAccount(addr);
-          localStorage.setItem(WALLET_KEY, addr);
+          storeWallet(addr);
           await loadLeaderboard(addr);
         }
+      } catch {
+        // no connected account yet; the connect button covers this
       } finally {
         setWalletChecked(true);
       }
@@ -364,7 +422,7 @@ export default function HomePage() {
       }
       const addr = accounts[0].toLowerCase() as Address;
       setAccount(addr);
-      localStorage.setItem(WALLET_KEY, addr);
+      storeWallet(addr);
       void loadLeaderboard(addr);
     };
     anyProvider.on?.("accountsChanged", onAccountsChanged);
@@ -671,15 +729,32 @@ export default function HomePage() {
 
   const submitOnchain = useCallback(async () => {
     if (!provider || !account) {
+      setStatusMessage("Connect a wallet before submitting a score.");
       return;
     }
     if (lastRunScore <= 0) {
+      setStatusMessage("Finish a run first.");
       return;
     }
     setSubmitting(true);
+    setStatusMessage("");
     try {
       await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CHAIN_ID_HEX }] });
-      const scoreWeiHex = `0x${BigInt(Math.max(1, lastRunScore)).toString(16)}`;
+      // The score belongs in GaslessScoreGame.submitScore(); the old call was a
+      // self-transfer of `score` wei, so nothing ever reached the contract and
+      // the "verified" column could never mean anything.
+      const contractAddress = getGameContractAddress();
+      const call = contractAddress
+        ? {
+            to: contractAddress,
+            value: "0x0",
+            data: encodeFunctionData({
+              abi: gameAbi,
+              functionName: "submitScore",
+              args: [BigInt(lastRunScore)]
+            })
+          }
+        : { to: account, value: `0x${BigInt(Math.max(1, lastRunScore)).toString(16)}` };
       let txHash: string | null = null;
       let sentViaSendCalls = false;
       let primaryError = "";
@@ -689,7 +764,7 @@ export default function HomePage() {
           chainId: CHAIN_ID_HEX,
           from: account,
           atomicRequired: false,
-          calls: [{ to: account, value: scoreWeiHex }]
+          calls: [call]
         };
         let sendResult: any = null;
         try {
@@ -745,7 +820,7 @@ export default function HomePage() {
         try {
           txHash = (await provider.request({
             method: "eth_sendTransaction",
-            params: [{ from: account, to: account, value: scoreWeiHex }]
+            params: [{ from: account, ...call }]
           })) as string;
         } catch (error) {
           const fallbackError = error instanceof Error ? error.message : "eth_sendTransaction failed";
@@ -755,6 +830,13 @@ export default function HomePage() {
         }
       }
       await submitLeaderboardRun(account, lastRunScore, true, 0);
+      setStatusMessage(
+        contractAddress
+          ? "Score submitted onchain. The verified column updates once the tx is mined."
+          : "Transaction sent. Set NEXT_PUBLIC_GAME_CONTRACT_ADDRESS to record scores in the contract."
+      );
+    } catch (error) {
+      setStatusMessage(errorText(error, "Could not submit the score onchain."));
     } finally {
       setSubmitting(false);
     }
@@ -828,6 +910,7 @@ export default function HomePage() {
             {!walletChecked || !account ? (
               <div className="menu-actions">
                 <button className="primary big" onClick={connect}>Connect Wallet To Play</button>
+                {statusMessage && <p className="status">{statusMessage}</p>}
               </div>
             ) : (
               <>
@@ -848,6 +931,7 @@ export default function HomePage() {
                     {submitting ? "Submitting..." : "Submit Onchain Score"}
                   </button>
                 </div>
+                {statusMessage && <p className="status">{statusMessage}</p>}
               </>
             )}
 

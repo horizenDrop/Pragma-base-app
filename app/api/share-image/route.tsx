@@ -2,11 +2,19 @@ import { ImageResponse } from "next/og";
 
 export const runtime = "edge";
 
+// Query values go straight into the rendered image, so clamp them instead of
+// letting a caller push arbitrary length through the renderer.
+function readNumber(value: string | null, fallback: number, max: number) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(0, Math.floor(numeric)));
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const level = searchParams.get("level") ?? "1";
-  const score = searchParams.get("score") ?? "0";
-  const verified = searchParams.get("verified") ?? "0";
+  const level = String(readNumber(searchParams.get("level"), 1, 999));
+  const score = String(readNumber(searchParams.get("score"), 0, 10_000_000));
+  const verified = String(readNumber(searchParams.get("verified"), 0, 10_000_000));
 
   return new ImageResponse(
     (

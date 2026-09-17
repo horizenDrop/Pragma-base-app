@@ -6,3 +6,6 @@ dist
 out
 coverage
 
+
+tsconfig.tsbuildinfo
+*.tsbuildinfo

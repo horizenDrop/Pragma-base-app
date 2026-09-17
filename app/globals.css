@@ -122,6 +122,14 @@ h1 {
   gap: 10px;
 }
 
+.status {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--muted);
+  word-break: break-word;
+}
+
 .leaderboard {
   margin-top: 12px;
   border: 1px solid var(--line);
